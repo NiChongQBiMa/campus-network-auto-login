@@ -61,6 +61,37 @@ def get_base_url(config):
 
 
 # ============================================================
+#  HTTP 会话
+# ============================================================
+
+def create_session():
+    """创建带浏览器 User-Agent 的 requests.Session，避免被网站拒绝"""
+    session = requests.Session()
+
+    # 伪装 Chrome 浏览器
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    })
+
+    # 自动重试：应对瞬时网络波动或服务器短暂拒绝
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    return session
+
+
+# ============================================================
 #  网络检测
 # ============================================================
 
@@ -109,69 +140,125 @@ def wait_for_network(host, port, timeout, interval):
 def analyze_login_form(html, config):
     """
     解析登录页面 HTML，提取表单字段
+    支持标准 <form> 和无 <form> 的现代页面（如路由器管理界面）
     返回: (fields_dict, post_data_dict, action_url)
     """
     username = config.get('account', 'username')
     password = config.get('account', 'password')
     save_password = config.get('account', 'save_password') == '1'
     base_url = get_base_url(config)
+    login_url = config.get('server', 'login_url')
 
     soup = BeautifulSoup(html, 'html.parser')
-    forms = soup.find_all('form')
-    if not forms:
-        raise Exception("页面中未找到登录表单，请确认登录地址是否正确")
-
-    form = forms[0]
-    action = form.get('action', '')
-
-    # 拼接完整 action URL
-    if action.startswith('http'):
-        action_url = action
-    elif action.startswith('/'):
-        parsed = urlparse(base_url)
-        action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
-    else:
-        action_url = base_url.rstrip('/') + '/' + action.lstrip('/')
 
     form_fields = {}
     post_data = {}
 
-    # 第一遍：收集隐藏字段 + 智能匹配
-    for inp in form.find_all('input'):
+    # ---- 查找表单容器 ----
+    form = None
+    forms = soup.find_all('form')
+    if forms:
+        form = forms[0]
+        logging.info("找到 <form> 标签")
+    else:
+        # 无 <form> 标签：在整个页面中搜索输入框
+        logging.info("页面无 <form> 标签，全局搜索输入框")
+
+    # ---- 确定 action URL ----
+    action_url = login_url  # 默认 POST 到登录页自身
+    if form:
+        action = form.get('action', '')
+        if action:
+            if action.startswith('http'):
+                action_url = action
+            elif action.startswith('/'):
+                parsed = urlparse(base_url)
+                action_url = f"{parsed.scheme}://{parsed.netloc}{action}"
+            else:
+                action_url = base_url.rstrip('/') + '/' + action.lstrip('/')
+
+    # ---- 搜索所有 input 元素 ----
+    container = form if form else soup
+    all_inputs = container.find_all('input')
+
+    # 用户名匹配模式（支持中英文命名习惯）
+    username_patterns = [
+        r'user(name|id)?', r'account', r'name', r'uname', r'uid', r'stu',
+        r'login.*name', r'^id$', r'^usr', r'^logname',
+    ]
+
+    for inp in all_inputs:
         name = inp.get('name', '')
         input_type = inp.get('type', 'text').lower()
         value = inp.get('value', '')
+        placeholder = (inp.get('placeholder', '') or '').lower()
+        input_id = (inp.get('id', '') or '').lower()
 
-        if not name:
+        if not name and not input_id:
             continue
 
+        # 优先级：name 属性 > id 属性
+        field_key = name if name else input_id
+
         if input_type == 'hidden':
-            post_data[name] = value
+            if name:
+                post_data[name] = value
             continue
 
         if input_type == 'password':
-            form_fields['password_field'] = name
-            post_data[name] = password
-        elif re.search(r'user|account|name|id|uname|uid|stu', name, re.I):
-            form_fields['username_field'] = name
-            post_data[name] = username
-        elif input_type == 'checkbox' and re.search(r'save|remember|keep|auto', name, re.I):
-            form_fields['save_field'] = name
-            if save_password:
-                post_data[name] = '1'
-        elif input_type == 'submit' or input_type == 'button':
-            form_fields['submit_field'] = name
+            form_fields['password_field'] = field_key
+            post_data[field_key] = password
+            continue
 
-    # 如果没匹配到用户名字段，兜底：取第一个 type=text 的 input
-    if 'username_field' not in form_fields:
-        for inp in form.find_all('input'):
-            if inp.get('type', 'text').lower() == 'text' and inp.get('name'):
-                form_fields['username_field'] = inp['name']
-                post_data[inp['name']] = username
+        # 智能匹配用户名字段（name/id/placeholder 任意命中即匹配）
+        is_username_field = False
+        for pat in username_patterns:
+            if re.search(pat, name, re.I) or re.search(pat, input_id, re.I) or re.search(pat, placeholder, re.I):
+                is_username_field = True
                 break
 
+        if is_username_field and input_type == 'text':
+            form_fields['username_field'] = field_key
+            post_data[field_key] = username
+        elif input_type == 'checkbox' and re.search(r'save|remember|keep|auto', name + input_id, re.I):
+            form_fields['save_field'] = field_key
+            if save_password:
+                post_data[field_key] = '1'
+        elif input_type in ('submit', 'button'):
+            form_fields['submit_field'] = field_key
+
+    # ---- 兜底：如果没匹配到用户名字段，取第一个 type=text ----
+    if 'username_field' not in form_fields:
+        for inp in all_inputs:
+            itype = inp.get('type', 'text').lower()
+            iname = inp.get('name', '') or inp.get('id', '')
+            if itype == 'text' and iname and 'password_field' not in form_fields:
+                continue
+            if itype == 'text' and iname:
+                form_fields['username_field'] = iname
+                post_data[iname] = username
+                break
+
+    # ---- 兜底：如果只有一个 text + 一个 password，自动配对 ----
+    if 'username_field' not in form_fields:
+        texts = [i for i in all_inputs if i.get('type', 'text').lower() == 'text' and (i.get('name') or i.get('id'))]
+        pwds = [i for i in all_inputs if i.get('type', '').lower() == 'password' and (i.get('name') or i.get('id'))]
+        if len(texts) == 1 and pwds:
+            key = texts[0].get('name') or texts[0].get('id')
+            form_fields['username_field'] = key
+            post_data[key] = username
+
+    # ---- 检查结果 ----
     if 'username_field' not in form_fields or 'password_field' not in form_fields:
-        raise Exception("无法识别用户名或密码输入框，请联系开发者")
+        found_inputs = [(i.get('name'), i.get('type'), i.get('id'))
+                        for i in all_inputs if i.get('name') or i.get('id')]
+        logging.warning(f"页面上找到的 input 元素: {found_inputs}")
+        raise Exception(
+            f"未识别到用户名或密码输入框\n"
+            f"页面上找到的输入框: {found_inputs}\n"
+            f"请手动查看网页源代码，确认输入框的 name/id 属性，\n"
+            f"然后填入 config.ini 的 [form] 段"
+        )
 
     form_fields['action_url'] = action_url
     logging.info(f"表单分析完成: action={action_url}, fields={form_fields}")
@@ -189,10 +276,7 @@ def perform_login(config):
     save_password = config.get('account', 'save_password') == '1'
     action_url = config.get('form', 'action_url')
 
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.112 Safari/537.36'
-    })
+    session = create_session()
 
     # ① GET 登录页面（获取可能的 CSRF token）
     logging.info(f"GET {login_url}")
@@ -334,31 +418,90 @@ def main():
         # 首次运行：分析表单
         logging.info("首次运行，分析登录表单...")
         try:
-            resp = requests.get(login_url, timeout=15)
+            session = create_session()
+            resp = session.get(login_url, timeout=15, allow_redirects=True)
+            logging.info(f"GET {login_url} → 状态码: {resp.status_code}, 内容长度: {len(resp.text)} 字符")
+            if resp.status_code != 200:
+                raise Exception(f"服务器返回状态码 {resp.status_code}（期望 200）")
+            if len(resp.text) < 100:
+                snippet = resp.text[:300].replace('\n', ' ')
+                logging.warning(f"响应内容异常短，可能是反爬虫拦截。前300字符: {snippet}")
+                raise Exception(f"服务器返回内容异常短（{len(resp.text)}字符），可能被反爬虫拦截。\n响应片段: {snippet}")
+
             fields, post_data, action_url = analyze_login_form(resp.text, config)
             save_form_config(fields)
 
             # 重新加载含 [form] 段的配置
             config = load_config()
+        except requests.exceptions.SSLError as e:
+            msg = f"SSL证书验证失败\n\n如果校园网使用自签名证书，请将登录地址改为 http:// 开头\n\n详情: {e}"
+            show_popup("登录失败 ❌", msg)
+            logging.error(f"SSL错误: {e}")
+            sys.exit(1)
+        except requests.exceptions.ConnectionError as e:
+            msg = f"服务器拒绝连接\n\n{host} 主动断开了连接\n可能原因：目标网站有反爬虫保护，或地址不可达\n\n校园网内网地址通常不会有此问题\n\n详情: {e}"
+            show_popup("登录失败 ❌", msg)
+            logging.error(f"连接错误: {e}")
+            sys.exit(1)
+        except requests.exceptions.Timeout:
+            msg = f"请求超时\n\n{host} 响应时间过长"
+            show_popup("登录失败 ❌", msg)
+            logging.error("请求超时")
+            sys.exit(1)
         except Exception as e:
             msg = f"无法分析登录表单\n\n{str(e)}"
             show_popup("登录失败 ❌", msg)
             logging.error(msg)
             sys.exit(1)
 
-    # 5. 执行登录
-    try:
-        success, html = perform_login(config)
-    except requests.exceptions.ConnectionError:
-        msg = "无法连接到校园网服务器\n\n请检查网络是否正常"
-        show_popup("登录失败 ❌", msg)
-        logging.error(msg)
-        sys.exit(1)
-    except Exception as e:
-        msg = f"登录请求异常\n\n{str(e)}"
-        show_popup("登录失败 ❌", msg)
-        logging.error(msg)
-        sys.exit(1)
+    # 5. 执行登录（如果页面结构变化，自动重新分析表单）
+    MAX_ATTEMPTS = 2
+    success = False
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            success, html = perform_login(config)
+            if success:
+                break  # 登录成功，跳出循环
+            else:
+                logging.warning(f"第{attempt}次登录未检测到成功标志")
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.SSLError,
+                requests.exceptions.Timeout) as e:
+            # 网络层错误不重试分析，直接退出
+            if isinstance(e, requests.exceptions.SSLError):
+                msg = f"SSL证书验证失败\n\n详情: {e}"
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                msg = f"无法连接到校园网服务器\n\n服务器主动断开连接\n可能原因：目标网站有反爬虫保护\n\n详情: {e}"
+            else:
+                msg = "请求超时\n\n服务器响应时间过长"
+            show_popup("登录失败 ❌", msg)
+            logging.error(str(e))
+            sys.exit(1)
+        except Exception as e:
+            logging.error(f"登录请求异常: {e}")
+
+        # 登录未成功，尝试重新分析表单（清除缓存 + 重新 GET）
+        if attempt < MAX_ATTEMPTS:
+            logging.info("尝试重新分析登录表单...")
+            try:
+                # 清除旧的 [form] 配置
+                config.remove_section('form')
+                config.add_section('form')
+                with open(get_config_path(), 'w', encoding='utf-8') as f:
+                    config.write(f)
+                logging.info("已清除缓存的表单配置")
+
+                # 重新分析
+                session = create_session()
+                resp = session.get(login_url, timeout=15, allow_redirects=True)
+                logging.info(f"重新GET {login_url} → 状态码: {resp.status_code}")
+                fields, post_data, action_url = analyze_login_form(resp.text, config)
+                save_form_config(fields)
+                config = load_config()
+                logging.info("表单重新分析完成，将再次尝试登录")
+            except Exception as e2:
+                logging.error(f"重新分析表单也失败: {e2}")
+                # 不退出，让外层错误处理接管
 
     # 6. 提示结果
     if success:
