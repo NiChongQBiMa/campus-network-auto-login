@@ -1,13 +1,26 @@
-# 校园网自动登录 🎓
+# 校园网自动登录 🎓 — 北京朝阳校园网专用版
+
+> **⚠️ 分支说明：** 本分支（`北京朝阳校园网1`）是 Dr.COM 认证系统专用版。
+> 如需通用版（支持自动分析任意登录表单），请切换到 [`main`](../../tree/main) 分支。
 
 哈哈😄 各位电教委员是否因为总是忘记登录校园网而被老师骂呢？这里是我们的救星：
 Windows 开机自动登录校园网认证系统，无需手动打开浏览器输入账号密码。
 
+## 与通用版的区别
+
+| | `main` 通用版 | `北京朝阳校园网1` 专用版 |
+|---|---|---|
+| 适用场景 | 任意 Web 表单认证系统 | **仅 Dr.COM（城市热点）** |
+| 表单字段 | 自动分析、自适应 | **固定 `DDDDD` / `upass`** |
+| 依赖 | `requests` + `beautifulsoup4` | **仅 `requests`** |
+| 代码量 | ~500 行 | **~250 行** |
+| 配置文件 | 含 `[form]` 缓存段 | **无 `[form]` 段** |
+| 认证方式 | 自动提取 action 地址 | **POST 到登录页自身（80端口）** |
+
 ## 适用场景
 
-- 学校/公司机房每天需要手动登录校园网
+- 北京朝阳校园网（Dr.COM 认证系统，`10.26.13.2`）
 - Windows 7 及以上系统
-- 基于 Web 表单认证的校园网系统（深澜、锐捷、华为、Dr.COM 等）
 
 ## 快速开始
 
@@ -40,10 +53,10 @@ login_url = http://10.26.13.2
 ## 工作原理
 
 ```
-开机启动 → 等待网络就绪 → 分析登录表单 → POST账号密码 → 弹窗提示结果
+开机启动 → 等待网络就绪 → POST DDDDD/upass 到 10.26.13.2 → 弹窗提示结果
 ```
 
-首次运行时会自动分析校园网页面的表单结构，写入 `config.ini` 的 `[form]` 段，后续直接读取，秒级完成登录。
+Dr.COM 系统使用固定字段 `DDDDD`（账号）和 `upass`（密码），无需分析表单，直接提交即可。
 
 ## 文件说明
 
@@ -57,8 +70,8 @@ login_url = http://10.26.13.2
 ## 自行打包
 
 ```bash
-pip install requests beautifulsoup4 pyinstaller
-pyinstaller --onefile --noconsole --name 校园网登录 main.py
+pip install requests pyinstaller
+pyinstaller --onefile --noconsole --name 校园网登录 src/main.py
 ```
 
 输出文件在 `dist/` 目录下。
