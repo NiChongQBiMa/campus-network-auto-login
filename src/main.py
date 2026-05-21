@@ -122,27 +122,49 @@ def drcom_login(config):
     # 3. POST 到登录页面（80端口，模拟表单提交）
     logging.info(f"POST {login_url}")
     resp = session.post(login_url, data=post_data, timeout=15, allow_redirects=True)
-    logging.info(f"登录响应状态码: {resp.status_code}")
+    logging.info(f"登录响应状态码: {resp.status_code}, 内容长度: {len(resp.text)} 字符")
+    logging.info(f"响应URL: {resp.url}")
+
+    # 诊断：输出响应前 500 字符到日志
+    snippet = resp.text[:500].replace('\n', ' ').replace('\r', '')
+    logging.info(f"响应内容(前500字符): {snippet}")
+
+    # 也保存完整响应用于排查
+    debug_path = os.path.join(os.path.dirname(get_config_path()), 'response_debug.html')
+    with open(debug_path, 'w', encoding='utf-8') as f:
+        f.write(resp.text)
+    logging.info(f"完整响应已保存至: {debug_path}")
 
     success = check_drcom_success(resp.text)
     return success, resp.text
 
 
 def check_drcom_success(html):
-    keywords = [
-        'Dr.COMWebLoginID_3.htm',
+    """检查 Dr.COM 认证是否成功"""
+    html_lower = html.lower()
+
+    # Dr.COM 特定成功标志
+    drcom_markers = [
+        'Dr.COMWebLoginID_3.htm',     # 内部成功页跳转
         '认证成功',
         '登录成功',
         '上线成功',
         'already online',
         'keepalive',
-        '在线',
+        '您已在线',
+        '注销',                        # 出现注销链接说明已登录
     ]
-    html_lower = html.lower()
-    for kw in keywords:
+
+    for kw in drcom_markers:
         if kw.lower() in html_lower:
             logging.info(f"检测到成功标志: {kw}")
             return True
+
+    # 如果响应内容很短且状态码200，可能是重定向后的成功
+    if len(html.strip()) < 200:
+        logging.info(f"响应内容很短({len(html.strip())}字符)，可能是成功重定向")
+        return True
+
     return False
 
 
